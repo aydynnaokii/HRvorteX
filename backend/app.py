@@ -1,22 +1,18 @@
-# WellMind – VorteX HR Automation
-# File: backend/app.py
-# Description: Main Flask entry point for survey analysis, watsonx AI, orchestrate callbacks, and dashboard
-# Author: Ahmad Yasser (Technical Architecture)
-# License: MIT
-
+# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from database import db, BurnoutResult, Employee
 from services.watsonx_service import analyze_text_responses
 from services.hedera_service import store_hash_on_hedera
 from services.orchestrate_service import trigger_workflow
+from datetime import datetime
 import os
 
 app = Flask(__name__)
 CORS(app)
 
 # Database config
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/wellmind')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///wellmind.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 
@@ -28,10 +24,22 @@ def health():
     """Health check endpoint"""
     return jsonify({'status': 'ok', 'service': 'VorteX WellMind Backend'})
 
+@app.route('/api/predict', methods=['POST'])
+def predict():
+    """Predict burnout risk based on form data"""
+    data = request.json or {}
+    hours = int(data.get('work_hours') or 40)
+    stress = int(data.get('stress') or 5)
+    score = round((hours / 40) * 50 + (stress / 10) * 50)
+    risk = 'High' if score >= 70 else 'Medium' if score >= 40 else 'Low'
+    return jsonify({'risk': risk, 'score': score})
+
 @app.route('/api/survey', methods=['POST'])
 def submit_survey():
-    """Accept employee burnout survey data"""
+    """Accept employee burnout survey data and store in database"""
     data = request.json
+    
+    # Find or create employee
     employee = Employee.query.filter_by(email=data.get('email')).first()
     if not employee:
         employee = Employee(
@@ -42,91 +50,85 @@ def submit_survey():
         db.session.add(employee)
         db.session.commit()
     
-    return jsonify({
-        'employee_id': employee.id,
-        'message': 'Survey received, processing...'
-    })
-
-@app.route('/api/analyze', methods=['POST'])
-def analyze():
-    """
-    Main analysis endpoint:
-    1. Call watsonx.ai for burnout prediction
-    2. Store result in PostgreSQL
-    3. Send hash to Hedera Hashgraph
-    4. Trigger Watson Orchestrate workflow
-    """
-    data = request.json
-    employee_id = data.get('employee_id')
-    responses = data.get('responses', {})
+    # Calculate burnout risk
+    hours = int(data.get('work_hours', 40))
+    stress = int(data.get('stress', 5))
+    score = round((hours / 40) * 50 + (stress / 10) * 50)
+    risk = 'High' if score >= 70 else 'Medium' if score >= 40 else 'Low'
     
-    # Step 1: AI Analysis
-    result = analyze_text_responses(responses)
-    
-    # Step 2: Store in DB
-    record = BurnoutResult(
-        employee_id=employee_id,
-        risk_score=result['risk'],
-        label=result['label'],
-        orchestrate_status='pending'
+    # Create burnout result
+    burnout_result = BurnoutResult(
+        employee_id=employee.id,
+        risk_score=score,
+        label=risk,
+        work_hours=hours,
+        stress_level=stress,
+        orchestrate_status='pending',
+        watson_timestamp=datetime.utcnow()
     )
-    db.session.add(record)
+    db.session.add(burnout_result)
     db.session.commit()
     
-    # Step 3: Blockchain audit
+    # Store hash on Hedera
     try:
-        tx_id = store_hash_on_hedera(record.to_dict())
-        record.hedera_txid = tx_id
+        tx_id = store_hash_on_hedera(burnout_result.to_dict())
+        burnout_result.hedera_txid = tx_id
         db.session.commit()
     except Exception as e:
         print(f"Hedera error: {e}")
-        record.hedera_txid = 'SIMULATED_TX'
-        db.session.commit()
-    
-    # Step 4: Trigger orchestrate workflow
-    try:
-        workflow_resp = trigger_workflow(record.to_dict())
-        record.orchestrate_status = 'triggered'
-        db.session.commit()
-    except Exception as e:
-        print(f"Orchestrate error: {e}")
-        record.orchestrate_status = 'failed'
+        burnout_result.hedera_txid = 'SIMULATED_TX'
         db.session.commit()
     
     return jsonify({
-        'risk': result['risk'],
-        'label': result['label'],
-        'hedera_tx': record.hedera_txid,
-        'orchestrate': record.orchestrate_status
+        'employee_id': employee.id,
+        'result_id': burnout_result.id,
+        'risk': risk,
+        'score': score,
+        'message': 'Survey submitted successfully'
     })
-
-@app.route('/api/orchestrate/callback', methods=['POST'])
-def orchestrate_callback():
-    """Receive workflow status updates from Watson Orchestrate"""
-    data = request.json
-    result_id = data.get('result_id')
-    status = data.get('status')
-    
-    record = BurnoutResult.query.get(result_id)
-    if record:
-        record.orchestrate_status = status
-        db.session.commit()
-    
-    return jsonify({'status': 'callback received'})
 
 @app.route('/api/dashboard', methods=['GET'])
 def dashboard():
     """Provide risk and blockchain data for HR dashboard"""
-    results = BurnoutResult.query.order_by(BurnoutResult.watson_timestamp.desc()).limit(50).all()
-    flagged = BurnoutResult.query.filter(BurnoutResult.risk_score > 60).count()
+    total_employees = Employee.query.count()
+    total_surveys = BurnoutResult.query.count()
+    
+    high_risk = BurnoutResult.query.filter(BurnoutResult.risk_score >= 70).count()
+    medium_risk = BurnoutResult.query.filter(BurnoutResult.risk_score >= 40, BurnoutResult.risk_score < 70).count()
+    low_risk = BurnoutResult.query.filter(BurnoutResult.risk_score < 40).count()
+    
     avg_risk = db.session.query(db.func.avg(BurnoutResult.risk_score)).scalar() or 0
-    verified = BurnoutResult.query.filter(BurnoutResult.hedera_txid != None).count()
+    avg_hours = db.session.query(db.func.avg(BurnoutResult.work_hours)).scalar() or 0
+    avg_stress = db.session.query(db.func.avg(BurnoutResult.stress_level)).scalar() or 0
+    
+    # Department breakdown
+    departments = db.session.query(
+        Employee.department,
+        db.func.count(BurnoutResult.id),
+        db.func.avg(BurnoutResult.risk_score)
+    ).join(BurnoutResult).group_by(Employee.department).all()
+    
+    department_data = [
+        {'department': dept, 'count': count, 'avg_risk': round(avg_risk, 1)}
+        for dept, count, avg_risk in departments
+    ]
+    
+    # Recent submissions
+    recent_results = BurnoutResult.query.order_by(BurnoutResult.watson_timestamp.desc()).limit(10).all()
     
     return jsonify({
-        'flagged_employees': flagged,
-        'average_risk': round(avg_risk, 1),
-        'blockchain_verified': verified,
-        'recent_results': [r.to_dict() for r in results]
+        'summary': {
+            'total_employees': total_employees,
+            'total_surveys': total_surveys,
+            'high_risk_count': high_risk,
+            'medium_risk_count': medium_risk,
+            'low_risk_count': low_risk,
+            'average_risk': round(avg_risk, 1),
+            'average_hours': round(avg_hours, 1),
+            'average_stress': round(avg_stress, 1)
+        },
+        'departments': department_data,
+        'recent_submissions': [r.to_dict() for r in recent_results]
     })
 
 @app.route('/api/employees', methods=['GET'])
@@ -141,10 +143,30 @@ def list_employees():
             'name': emp.name,
             'department': emp.department,
             'email': emp.email,
-            'latest_risk': latest.risk_score if latest else None,
-            'latest_label': latest.label if latest else 'N/A'
+            'latest_risk_score': latest.risk_score if latest else None,
+            'latest_risk_label': latest.label if latest else 'No data',
+            'work_hours': latest.work_hours if latest else None,
+            'stress_level': latest.stress_level if latest else None,
+            'last_submission': latest.watson_timestamp.isoformat() if latest else None,
+            'hedera_verified': bool(latest.hedera_txid) if latest else False
         })
     return jsonify(data)
+
+@app.route('/api/employee/<int:employee_id>/history', methods=['GET'])
+def employee_history(employee_id):
+    """Get submission history for a specific employee"""
+    employee = Employee.query.get_or_404(employee_id)
+    submissions = BurnoutResult.query.filter_by(employee_id=employee_id).order_by(BurnoutResult.watson_timestamp.desc()).all()
+    
+    return jsonify({
+        'employee': {
+            'id': employee.id,
+            'name': employee.name,
+            'department': employee.department,
+            'email': employee.email
+        },
+        'submissions': [s.to_dict() for s in submissions]
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
