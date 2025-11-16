@@ -5,7 +5,8 @@ export async function GET() {
     // Forward request to Flask backend
     const flaskResponse = await fetch('http://localhost:5000/api/dashboard', {
       method: 'GET',
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 'Content-Type': 'application/json',  'Cache-Control': 'no-cache' },
+      cache: 'no-store'
     })
     
     if (!flaskResponse.ok) {
