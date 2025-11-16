@@ -13,8 +13,9 @@ CORS(app, origins=["http://localhost:3000"], supports_credentials=True)
 
 # Database config
 # Use absolute path for SQLite database
-db_path = os.getenv('DATABASE_URL', 'sqlite:///' + os.path.join(os.path.dirname(__file__), 'wellmind.db'))
+db_path = 'sqlite:///' + os.path.join(os.path.dirname(__file__), 'instance', 'wellmind.db')
 app.config['SQLALCHEMY_DATABASE_URI'] = db_path
+print(f"📁 [DATABASE] Using: {db_path}")
 print(f"[DATABASE] Connecting to: {db_path}")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
@@ -118,6 +119,22 @@ def submit_survey():
 @app.route('/api/dashboard', methods=['GET'])
 def dashboard():
     """Provide risk and blockchain data for HR dashboard"""
+    # DEBUG: Show database info
+    db_uri = app.config['SQLALCHEMY_DATABASE_URI']
+    print(f"🔍 [DATABASE DEBUG] Using database: {db_uri}")
+    
+    # DEBUG: Show all employees and their departments
+    all_employees = Employee.query.all()
+    print(f"🔍 [DATABASE DEBUG] Total employees: {len(all_employees)}")
+    for emp in all_employees:
+        print(f"🔍 [DATABASE DEBUG] Employee: {emp.name}, Dept: {emp.department}, ID: {emp.id}")
+    
+    # DEBUG: Show all burnout results
+    all_results = BurnoutResult.query.all()
+    print(f"🔍 [DATABASE DEBUG] Total survey results: {len(all_results)}")
+    for result in all_results:
+        print(f"🔍 [DATABASE DEBUG] Result: ID {result.id}, Employee ID {result.employee_id}, Score: {result.risk_score}")
+
     total_employees = Employee.query.count()
     total_surveys = BurnoutResult.query.count()
     
@@ -129,12 +146,12 @@ def dashboard():
     avg_hours = db.session.query(db.func.avg(BurnoutResult.work_hours)).scalar() or 0
     avg_stress = db.session.query(db.func.avg(BurnoutResult.stress_level)).scalar() or 0
     
-    # FIXED: Department breakdown - count distinct employees per department
+    # FIXED: Department breakdown - count employees per department directly
     departments = db.session.query(
         Employee.department,
-        db.func.count(db.func.distinct(Employee.id)),  # Count unique employees
+        db.func.count(Employee.id),  # Count all employees in department
         db.func.avg(BurnoutResult.risk_score)
-    ).outerjoin(BurnoutResult).group_by(Employee.department).all()
+    ).outerjoin(BurnoutResult, Employee.id == BurnoutResult.employee_id).group_by(Employee.department).all()
     
     department_data = [
         {'department': dept, 'count': count, 'avg_risk': round(dept_avg_risk or 0, 1)}
